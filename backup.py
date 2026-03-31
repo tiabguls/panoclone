@@ -11,7 +11,6 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 
-from prefect import flow, task
 
 _SSL_CONTEXT = ssl.create_default_context()
 
@@ -38,10 +37,10 @@ def make_request(url, api_key):
             error_data = body
         print(f"API Error {e.code} for {url}:")
         print(json.dumps(error_data, indent=2) if isinstance(error_data, dict) else error_data)
-        raise RuntimeError(f"API Error {e.code}") from e
+        sys.exit(1)
     except urllib.error.URLError as e:
         print(f"Connection error for {url}: {e.reason}")
-        raise RuntimeError(f"Connection error: {e.reason}") from e
+        sys.exit(1)
 
 
 def save_json(data, output_dir, timestamp, name):
@@ -66,103 +65,6 @@ def safe_name(name):
     return name.replace(" ", "_").replace("/", "-")
 
 
-@task
-def fetch_and_save(url, api_key, output_dir, timestamp, name):
-    """Fetch data from the Panorama API, save to JSON, and return the response."""
-    data = make_request(url, api_key)
-    save_json(data, output_dir, timestamp, name)
-    return data
-
-
-@flow(name="panorama-backup", log_prints=True)
-def backup_flow(base_url, api_key, output_dir, timestamp, device_groups_data):
-    device_groups = [e["@name"] for e in get_entries(device_groups_data)]
-    print(f"Found {len(device_groups)} device group(s): {', '.join(device_groups)}")
-
-    # Templates and Template Stacks in parallel
-    templates_future = fetch_and_save.with_options(name="fetch-templates").submit(
-        f"{base_url}/Panorama/Templates", api_key, output_dir, timestamp, "templates"
-    )
-    stacks_future = fetch_and_save.with_options(name="fetch-template-stacks").submit(
-        f"{base_url}/Panorama/TemplateStacks", api_key, output_dir, timestamp, "template-stacks"
-    )
-
-    templates_data = templates_future.result()
-    stacks_future.result()
-
-    templates = [e["@name"] for e in get_entries(templates_data)]
-    print(f"Found {len(templates)} template(s): {', '.join(templates)}")
-
-    # VirtualSystems per Template — submitted in parallel
-    vsys_futures = {
-        template: fetch_and_save.with_options(name=f"fetch-vsys-{safe_name(template)}").submit(
-            f"{base_url}/Panorama/Templates/VirtualSystems?template={urllib.parse.quote(template)}",
-            api_key, output_dir, timestamp,
-            f"template-{safe_name(template)}-virtualsystems",
-        )
-        for template in templates
-    }
-
-    # Zones per VirtualSystem — submitted as vsys results arrive
-    zone_futures = []
-    for template, vsys_future in vsys_futures.items():
-        vsys_data = vsys_future.result()
-        vsys_list = [e["@name"] for e in get_entries(vsys_data)]
-        tname = safe_name(template)
-        tparam = urllib.parse.quote(template)
-        print(f"  Template {template}: {len(vsys_list)} virtual system(s)")
-        for vsys in vsys_list:
-            zone_futures.append(
-                fetch_and_save.with_options(name=f"fetch-zones-{tname}-{safe_name(vsys)}").submit(
-                    f"{base_url}/Network/Zones"
-                    f"?location=template&template={tparam}&vsys={urllib.parse.quote(vsys)}",
-                    api_key, output_dir, timestamp,
-                    f"template-{tname}-vsys-{safe_name(vsys)}-zones",
-                )
-            )
-
-    # Objects — shared + per device group, all submitted in parallel
-    object_futures = []
-    for _label, endpoint in OBJECT_TYPES:
-        object_futures.append(
-            fetch_and_save.with_options(name=f"fetch-shared-{endpoint.lower()}").submit(
-                f"{base_url}/Objects/{endpoint}?location=shared",
-                api_key, output_dir, timestamp, f"shared-{endpoint.lower()}",
-            )
-        )
-        for dg in device_groups:
-            dgname = safe_name(dg)
-            object_futures.append(
-                fetch_and_save.with_options(name=f"fetch-dg-{dgname}-{endpoint.lower()}").submit(
-                    f"{base_url}/Objects/{endpoint}"
-                    f"?location=device-group&device-group={urllib.parse.quote(dg)}",
-                    api_key, output_dir, timestamp, f"dg-{dgname}-{endpoint.lower()}",
-                )
-            )
-
-    # SecurityPreRules — shared + per device group, all submitted in parallel
-    rules_futures = [
-        fetch_and_save.with_options(name="fetch-shared-security-pre-rules").submit(
-            f"{base_url}/Policies/SecurityPreRules?location=shared",
-            api_key, output_dir, timestamp, "shared-security-pre-rules",
-        )
-    ]
-    for dg in device_groups:
-        dgname = safe_name(dg)
-        rules_futures.append(
-            fetch_and_save.with_options(name=f"fetch-dg-{dgname}-security-pre-rules").submit(
-                f"{base_url}/Policies/SecurityPreRules"
-                f"?location=device-group&device-group={urllib.parse.quote(dg)}",
-                api_key, output_dir, timestamp, f"dg-{dgname}-security-pre-rules",
-            )
-        )
-
-    for f in zone_futures + object_futures + rules_futures:
-        f.result()
-
-    print(f"\nBackup complete. Files saved to: {output_dir}")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Backup Palo Alto Panorama configurations.")
     parser.add_argument("hostname", help="Panorama API hostname")
@@ -181,23 +83,87 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
-    # First API call triggers the MFA session — done outside the flow so we can
-    # pause for the user to complete MFA before any further requests are made.
     print("\nConnecting to Panorama API...")
-    try:
-        device_groups_data = make_request(f"{base_url}/Panorama/DeviceGroups", api_key)
-    except RuntimeError:
-        sys.exit(1)
-
+    device_groups_data = make_request(f"{base_url}/Panorama/DeviceGroups", api_key)
     save_json(device_groups_data, output_dir, timestamp, "device-groups")
 
     input("\nPlease complete multi-factor authentication, then press Enter to continue...")
     print()
 
-    try:
-        backup_flow(base_url, api_key, output_dir, timestamp, device_groups_data)
-    except Exception:
-        sys.exit(1)
+    device_groups = [e["@name"] for e in get_entries(device_groups_data)]
+    print(f"Found {len(device_groups)} device group(s): {', '.join(device_groups)}")
+
+    # Templates
+    print("\nRetrieving Templates...")
+    templates_data = make_request(f"{base_url}/Panorama/Templates", api_key)
+    save_json(templates_data, output_dir, timestamp, "templates")
+    templates = [e["@name"] for e in get_entries(templates_data)]
+    print(f"Found {len(templates)} template(s): {', '.join(templates)}")
+
+    # Template Stacks
+    print("\nRetrieving Template Stacks...")
+    stacks_data = make_request(f"{base_url}/Panorama/TemplateStacks", api_key)
+    save_json(stacks_data, output_dir, timestamp, "template-stacks")
+
+    # VirtualSystems and Zones per Template
+    for template in templates:
+        tname = safe_name(template)
+        tparam = urllib.parse.quote(template)
+
+        print(f"\nRetrieving VirtualSystems for template: {template}...")
+        vsys_data = make_request(
+            f"{base_url}/Panorama/Templates/VirtualSystems?template={tparam}",
+            api_key,
+        )
+        save_json(vsys_data, output_dir, timestamp, f"template-{tname}-virtualsystems")
+        vsys_list = [e["@name"] for e in get_entries(vsys_data)]
+        print(f"  Found {len(vsys_list)} virtual system(s): {', '.join(vsys_list)}")
+
+        for vsys in vsys_list:
+            print(f"  Retrieving Network Zones for vsys: {vsys}...")
+            zones_data = make_request(
+                f"{base_url}/Network/Zones"
+                f"?location=template&template={tparam}&vsys={urllib.parse.quote(vsys)}",
+                api_key,
+            )
+            save_json(zones_data, output_dir, timestamp, f"template-{tname}-vsys-{safe_name(vsys)}-zones")
+
+    # Objects — shared
+    print("\nRetrieving shared objects...")
+    for _, endpoint in OBJECT_TYPES:
+        print(f"  Retrieving shared {endpoint}...")
+        data = make_request(f"{base_url}/Objects/{endpoint}?location=shared", api_key)
+        save_json(data, output_dir, timestamp, f"shared-{endpoint.lower()}")
+
+    # Objects — per device group
+    for dg in device_groups:
+        dgname = safe_name(dg)
+        dgparam = urllib.parse.quote(dg)
+        print(f"\nRetrieving objects for device group: {dg}...")
+        for _, endpoint in OBJECT_TYPES:
+            print(f"  Retrieving {endpoint}...")
+            data = make_request(
+                f"{base_url}/Objects/{endpoint}?location=device-group&device-group={dgparam}",
+                api_key,
+            )
+            save_json(data, output_dir, timestamp, f"dg-{dgname}-{endpoint.lower()}")
+
+    # SecurityPreRules
+    print("\nRetrieving shared SecurityPreRules...")
+    shared_rules = make_request(f"{base_url}/Policies/SecurityPreRules?location=shared", api_key)
+    save_json(shared_rules, output_dir, timestamp, "shared-security-pre-rules")
+
+    for dg in device_groups:
+        dgname = safe_name(dg)
+        print(f"\nRetrieving SecurityPreRules for device group: {dg}...")
+        rules_data = make_request(
+            f"{base_url}/Policies/SecurityPreRules"
+            f"?location=device-group&device-group={urllib.parse.quote(dg)}",
+            api_key,
+        )
+        save_json(rules_data, output_dir, timestamp, f"dg-{dgname}-security-pre-rules")
+
+    print(f"\nBackup complete. Files saved to: {output_dir}")
 
 
 if __name__ == "__main__":
