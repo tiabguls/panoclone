@@ -87,9 +87,6 @@ def main():
     device_groups_data = make_request(f"{base_url}/Panorama/DeviceGroups", api_key)
     save_json(device_groups_data, output_dir, timestamp, "device-groups")
 
-    input("\nPlease complete multi-factor authentication, then press Enter to continue...")
-    print()
-
     device_groups = [e["@name"] for e in get_entries(device_groups_data)]
     print(f"Found {len(device_groups)} device group(s): {', '.join(device_groups)}")
 
