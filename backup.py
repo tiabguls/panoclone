@@ -112,7 +112,7 @@ def main():
 
         print(f"\nRetrieving VirtualSystems for template: {template}...")
         vsys_data = make_request(
-            f"{base_url}/Panorama/Templates/VirtualSystems?template={tparam}",
+            f"{base_url}/Device/VirtualSystems?location=template&template={tparam}",
             api_key,
         )
         save_json(vsys_data, output_dir, timestamp, f"template-{tname}-virtualsystems")
