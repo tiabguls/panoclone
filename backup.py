@@ -13,6 +13,8 @@ from datetime import datetime
 
 
 _SSL_CONTEXT = ssl.create_default_context()
+_SSL_CONTEXT.check_hostname = False
+_SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 OBJECT_TYPES = [
     ("Tags",          "Tags"),
